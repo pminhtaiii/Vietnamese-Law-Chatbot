@@ -1,0 +1,3 @@
+# RAGAS evaluation via live API instead of direct retriever import
+
+RAGAS evaluation runs through the live `POST /api/retrieve` endpoint rather than importing the Retriever class directly. The alternative — calling `retriever.search_laws()` in-process — is faster and avoids network overhead, but it skips intent routing, web fallback, and the full request pipeline. Since the goal of evaluation is to measure what production users actually experience, the live API is the correct evaluation target. Direct-import evaluation can be added later as a supplementary CI check if needed.

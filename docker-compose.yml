@@ -1,0 +1,118 @@
+# ─────────────────────────────────────────────────────────────────────
+# Unified Docker Compose for Law Chatbot
+# Services: Qdrant + Backend API, Frontend UI, Evaluation Worker
+# ─────────────────────────────────────────────────────────────────────
+#
+# Usage:
+#   docker compose up -d                        # Start backend + frontend
+#   docker compose --profile eval up evaluation-worker  # Run evaluation
+#   docker compose down                          # Stop all services
+#
+# Copy .env.example → .env and fill in your API keys before running.
+
+services:
+  # ── Backend (Qdrant + FastAPI) ──────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant_server
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      - QDRANT__STORAGE__ON_DISK_PAYLOAD=true
+    deploy:
+      resources:
+        limits:
+          memory: 5G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:6333/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - law_chatbot_net
+
+  backend-api:
+    build: ./backend
+    container_name: backend-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    environment:
+      - QDRANT_HOST=http://qdrant:6333
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - COHERE_API_KEY=${COHERE_API_KEY}
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - law_chatbot_net
+
+  # ── Frontend UI ─────────────────────────────────────────────────────
+  frontend-ui:
+    image: yidadaa/chatgpt-next-web
+    container_name: chatgpt-next-web
+    ports:
+      - "3000:3000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - CODE=${CODE}
+      - BASE_URL=http://backend-api:8000
+      - HIDE_USER_API_KEY=1
+      - DISABLE_GPT4=0
+      - ENABLE_BALANCE_QUERY=0
+      - DISABLE_FAST_LINK=0
+    depends_on:
+      - backend-api
+    networks:
+      - law_chatbot_net
+
+  # ── Evaluation Worker ──────────────────────────────────────────────
+  # Only runs when explicitly requested via the "eval" profile.
+  # Examples:
+  #   docker compose --profile eval run --rm evaluation-worker python build_golden_dataset.py --help
+  #   docker compose --profile eval run --rm evaluation-worker python ragas_evaluator.py --help
+  #   docker compose --profile eval run --rm evaluation-worker python legal_rag_evaluator.py --help
+  evaluation-worker:
+    build: ./evaluation
+    container_name: evaluation_worker
+    profiles: ["eval"]
+    volumes:
+      - ./evaluation:/app
+      - ./evaluation/eval_results:/app/eval_results
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      backend-api:
+        condition: service_started
+      qdrant:
+        condition: service_healthy
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_HOST=http://qdrant:6333
+      - BACKEND_URL=http://backend-api:8000
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - COHERE_API_KEY=${COHERE_API_KEY}
+      - MIMO_API_KEY=${MIMO_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    networks:
+      - law_chatbot_net
+
+# ── Volumes ──────────────────────────────────────────────────────────
+volumes:
+  qdrant_data:
+  hf_cache:
+
+# ── Network ──────────────────────────────────────────────────────────
+networks:
+  law_chatbot_net:
+    driver: bridge

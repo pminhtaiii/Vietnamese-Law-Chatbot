@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+qdrant-client
+FlagEmbedding
+openai
+transformers==4.44.2
+pydantic-settings
+tavily-python
+cohere
+cachetools
+lancedb
+pandas
+torch
+sentencepiece
+accelerate

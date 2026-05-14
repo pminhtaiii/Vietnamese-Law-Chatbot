@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Large datasets and models
+data/
+models/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs and Artifacts
+*.log
+logs/
+output/
+artifacts/
+
+# Data Pipelines (GraphRAG outputs)
+data_pipelines/graph_rag/output/
+data_pipelines/graph_rag/logs/
+data_pipelines/graph_rag/input/
+
+# Evaluation outputs (Generated datasets, CSV, JSONL reports)
+evaluation/eval_results/
+
+# OS specific
+.DS_Store
+Thumbs.db

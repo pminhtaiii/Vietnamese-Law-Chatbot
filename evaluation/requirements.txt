@@ -1,0 +1,34 @@
+# Dependencies for evaluation scripts
+# - build_golden_dataset.py: Qdrant sampling + LLM question generation
+# - ragas_evaluator.py: RAGAS metrics evaluation
+# - legal_rag_evaluator.py: Custom legal evaluation with Gemini + Cohere
+# - validate_golden_dataset.py: Validate generated Q&A quality
+
+# Qdrant client for build_golden_dataset.py
+qdrant-client
+
+# LLM clients
+openai
+google-generativeai
+langchain-google-genai
+cohere
+
+# RAGAS evaluation framework
+ragas
+langchain
+langchain-openai
+langchain-core
+
+# Data processing
+pandas
+datasets
+tqdm
+
+# HTTP client
+httpx
+
+# Environment management
+python-dotenv
+
+# MLflow (optional, used in legal_rag_evaluator)
+mlflow
