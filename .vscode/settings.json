@@ -1,6 +1,0 @@
-{
-    "python-envs.defaultEnvManager": "ms-python.python:venv",
-    "chat.tools.terminal.autoApprove": {
-        "Copy-Item": true
-    }
-}
