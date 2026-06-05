@@ -260,7 +260,7 @@ async def handle_chat(
                 sub_entities=reflection.sub_entities,
                 local_reranker=local_reranker,
             ),
-            timeout=120.0,  # 120s — 5.75M points + CPU BGE-M3 + reranker is slow
+            timeout=120.0,  # 120s — 5.75M points + CPU DEk21 + reranker can be slow
         )
     except asyncio.TimeoutError:
         log.error("[routes] Retrieval timed out after 120s")
@@ -359,14 +359,17 @@ def _format_sources(docs: List[Dict], include_content: bool = False) -> List[Dic
 
     Strips the raw text (too large for the response object) and keeps only
     the metadata the frontend needs to render source chips, unless include_content is True.
+
+    Supports both flat payloads (new parent-child pipeline: title/url at top level)
+    and nested metadata dicts (legacy format).
     """
     sources = []
     for doc in docs:
         meta = doc.get("metadata", {})
         source_dict = {
             "id":     doc.get("cid") or doc.get("id", ""),
-            "title":  meta.get("title", ""),
-            "url":    meta.get("source", ""),
+            "title":  meta.get("title") or doc.get("title", ""),
+            "url":    meta.get("source") or meta.get("url") or doc.get("url", ""),
             "score":  round(doc.get("score", 0.0), 4),
             "entity": doc.get("entity_label", ""),
         }

@@ -12,16 +12,16 @@ Architecture:
     Pipeline (per request):
         1. QueryReflector  — intent routing (7-intent taxonomy) + query rewriting
         2. Retriever       — intent-aware hybrid search (Qdrant + Local/Cohere rerank)
-        3. Generator       — intent-aware streaming generation (Gemini via AsyncOpenAI)
+        3. Generator       — intent-aware streaming generation (MiMo v2.5 Pro via AsyncOpenAI)
         4. TavilyLegalSearcher — web fallback when local RAG scores are low
 
     Client strategy:
         Both QueryReflector and Generator share a single AsyncOpenAI client pointed
-        at Google's OpenAI-compatible Gemini endpoint.  This avoids two separate
+        at Xiaomi's OpenAI-compatible MiMo endpoint.  This avoids two separate
         HTTP connection pools and keeps key management in one place.
 
-        Gemini OpenAI-compat endpoint:
-            https://generativelanguage.googleapis.com/v1beta/openai/
+        MiMo OpenAI-compat endpoint:
+            https://api.xiaomimimo.com/v1
 
     SSE protocol:
         Streaming responses follow OpenAI chunk format.  The pipeline's internal
@@ -62,6 +62,7 @@ from app.services.retriever import Retriever
 from app.services.graph_retriever import GraphRAGRetriever
 from app.services.web_searcher import web_searcher_engine
 from app.services.local_reranker import LocalReranker
+from app.services.parent_store import ParentStore
 
 # ──────────────────────────────────────────────
 # Structured Logging
@@ -98,7 +99,7 @@ async def lifespan(app: FastAPI):
         AsyncOpenAI    — shares a single connection pool across reflector + generator.
         QueryReflector — wraps the LLM client for intent routing.
         Generator      — wraps the LLM client for streaming generation.
-        BGEM3FlagModel — local embedding model for query encoding (~2GB RAM).
+        SentenceTransformer (DEk21) — local embedding model for query encoding (~400MB RAM).
         AsyncQdrantClient — connection to Qdrant vector DB.
         LocalReranker  — local Vietnamese reranker (primary).
         cohere.AsyncClientV2 — Cohere reranker API client (fallback).
@@ -110,10 +111,10 @@ async def lifespan(app: FastAPI):
     logger.info("=" * 60)
     logger.info("Starting Vietnamese Law RAG API v3.1 ...")
 
-    # ── Shared async LLM client ──────────────────────────────────
+    # ── Shared async LLM client (MiMo v2.5 Pro) ─────────────────────
     llm_client = AsyncOpenAI(
-        api_key=settings.GEMINI_API_KEY,
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        api_key=settings.MIMO_API_KEY,
+        base_url=settings.MIMO_BASE_URL,
     )
 
     # ── Pipeline services ────────────────────────────────────────
@@ -127,31 +128,31 @@ async def lifespan(app: FastAPI):
         max_tokens=2048,
     )
 
-    # ── Embedding model (BGE-M3) ─────────────────────────────────
-    # Loaded once at startup. use_fp16 controlled by config (default False
-    # for CPU-only Docker; set True when GPU is available).
+    # ── Embedding model (DEk21 SentenceTransformer) ──────────────
+    # Loaded once at startup. DEk21 is a lightweight 768-dim dense-only model.
+    # Much smaller RAM footprint than BGE-M3 (~2GB → ~400MB).
     embedding_model = None
     try:
-        import transformers
-        # Monkey-patch AutoModel to ignore 'dtype' kwarg incorrectly passed by FlagEmbedding
-        _orig_from_pretrained = transformers.AutoModel.from_pretrained
-        
-        @classmethod
-        def _patched_from_pretrained(cls, *args, **kwargs):
-            kwargs.pop('dtype', None)
-            return _orig_from_pretrained(*args, **kwargs)
-            
-        transformers.AutoModel.from_pretrained = _patched_from_pretrained
-        
-        from FlagEmbedding import BGEM3FlagModel
-        logger.info("Loading BGE-M3 embedding model: %s ...", settings.EMBEDDING_MODEL)
-        embedding_model = BGEM3FlagModel(
-            settings.EMBEDDING_MODEL,
-            use_fp16=False, # Forced to False due to transformers dtype bug
-        )
-        logger.info("✅ BGE-M3 loaded successfully.")
+        # --- FIX: Auto-delete HuggingFace .lock files to prevent download hangs ---
+        import os
+        import glob
+        hf_cache_dir = os.environ.get("HF_HOME", "/root/.cache/huggingface")
+        lock_files = glob.glob(f"{hf_cache_dir}/**/*.lock", recursive=True)
+        if lock_files:
+            logger.warning("Found %d HuggingFace .lock files. Deleting to prevent hang...", len(lock_files))
+            for lf in lock_files:
+                try:
+                    os.remove(lf)
+                except Exception:
+                    pass
+        # --------------------------------------------------------------------------
+
+        from sentence_transformers import SentenceTransformer
+        logger.info("Loading DEk21 embedding model: %s ...", settings.EMBEDDING_MODEL)
+        embedding_model = SentenceTransformer(settings.EMBEDDING_MODEL)
+        logger.info("✅ DEk21 loaded successfully (dim=%d).", embedding_model.get_sentence_embedding_dimension())
     except Exception as exc:
-        logger.error("❌ Failed to load BGE-M3: %s — retriever will degrade to web fallback", exc)
+        logger.error("❌ Failed to load DEk21: %s — retriever will degrade to web fallback", exc)
 
     # ── Qdrant async client ──────────────────────────────────────
     qdrant_client = None
@@ -197,15 +198,27 @@ async def lifespan(app: FastAPI):
         logger.warning("⚠️  COHERE_API_KEY not set — reranking disabled (vector scores only).")
 
     # ── Local reranker ───────────────────────────────────────────
-    try:
-        _local_reranker = LocalReranker(
-            model_name=settings.RERANKER_MODEL,
-            max_length=settings.RERANKER_MAX_LENGTH,
-            request_max_length=settings.RERANKER_REQUEST_MAX_LENGTH,
-        )
-        _local_reranker.initialize()
-    except Exception as exc:
-        logger.error("❌ Local reranker init failed: %s", exc)
+    if settings.USE_LOCAL_RERANKER:
+        try:
+            _local_reranker = LocalReranker(
+                model_name=settings.RERANKER_MODEL,
+                max_length=settings.RERANKER_MAX_LENGTH,
+                request_max_length=settings.RERANKER_REQUEST_MAX_LENGTH,
+            )
+            _local_reranker.initialize()
+        except Exception as exc:
+            logger.error("❌ Local reranker init failed: %s", exc)
+    else:
+        logger.info("⚠️  Local reranker disabled (USE_LOCAL_RERANKER=false).")
+
+    # ── Parent Store (SQLite lookup for parent_text) ────────────
+    parent_store = None
+    if settings.PARENTS_SQLITE_PATH:
+        try:
+            parent_store = ParentStore(settings.PARENTS_SQLITE_PATH)
+            logger.info("✅ ParentStore loaded: %s", settings.PARENTS_SQLITE_PATH)
+        except Exception as exc:
+            logger.error("❌ ParentStore init failed: %s — retriever will lack parent_text", exc)
 
     # ── Retriever (fully wired) ──────────────────────────────────
     _retriever = Retriever(
@@ -213,6 +226,7 @@ async def lifespan(app: FastAPI):
         cohere_client=cohere_client,
         local_reranker=_local_reranker,
         embedding_model=embedding_model,
+        parent_store=parent_store,
         collection_name=settings.COLLECTION_NAME,
     )
 
@@ -221,7 +235,6 @@ async def lifespan(app: FastAPI):
         _graph_retriever = GraphRAGRetriever(
             lancedb_path=settings.GRAPHRAG_LANCEDB_PATH,
             embedding_model=embedding_model,
-            entities_parquet=settings.GRAPHRAG_ENTITIES_PARQUET,
             relationships_parquet=settings.GRAPHRAG_RELATIONSHIPS_PARQUET,
             local_reranker=_local_reranker,
         )
@@ -233,7 +246,7 @@ async def lifespan(app: FastAPI):
     logger.info("   reflector model : %s", settings.QUERY_REFLECT_MODEL)
     logger.info("   generator model : %s", settings.LLM_MODEL)
     logger.info("   collection      : %s", settings.COLLECTION_NAME)
-    logger.info("   embedder        : %s", "BGE-M3" if embedding_model else "NONE")
+    logger.info("   embedder        : %s", "DEk21" if embedding_model else "NONE")
     logger.info("   local_reranker  : %s", "Vietnamese_Reranker" if _local_reranker else "NONE")
     logger.info("   cohere_reranker : %s", "Cohere" if cohere_client else "NONE")
     logger.info("   graphrag        : %s", "Enabled" if _graph_retriever else "Disabled")
@@ -247,7 +260,10 @@ async def lifespan(app: FastAPI):
     if qdrant_client:
         await qdrant_client.close()
     if cohere_client:
-        await cohere_client.close()
+        try:
+            await cohere_client.close()
+        except AttributeError:
+            pass
     logger.info("Shutdown complete.")
 
 

@@ -6,8 +6,10 @@ to retrieve entity descriptions, community reports, and related text units
 using vector similarity search.
 
 Design decisions:
-  - Reuses the BGE-M3 embedding model already loaded in main.py lifespan
-    (zero extra init cost — same model, same vectors).
+  - Reuses the DEk21 SentenceTransformer already loaded in main.py lifespan
+    (zero extra init cost — same model, same 768-dim vectors).
+  - LanceDB tables MUST be rebuilt with DEk21 embeddings (768-dim) before
+    GraphRAG search works. Run 06_build_embeddings_lancedb.py with DEk21.
   - LanceDB queries are local file-based — no network round-trip.
   - Graph neighbor expansion uses in-memory entity→relationship lookup
     loaded from parquet at startup (fast, but ~400MB RAM for the full graph).
@@ -17,8 +19,8 @@ Design decisions:
     returns empty results (caller falls back to vector RAG).
 
 Tables queried:
-  - entity_description: (id, name, description, vector)
-  - community_full_content: (community, title, full_content, vector)
+  - entity_description: (id, name, description, vector) [768-dim DEk21]
+  - community_full_content: (community, title, full_content, vector) [768-dim DEk21]
 
 Optional (if loaded):
   - Relationships parquet for graph neighbor expansion.
@@ -58,13 +60,11 @@ class GraphRAGRetriever:
         self,
         lancedb_path: str,
         embedding_model: Any = None,
-        entities_parquet: Optional[str] = None,
         relationships_parquet: Optional[str] = None,
         local_reranker: Any = None,
     ):
         self._lancedb_path = lancedb_path
         self._embedder = embedding_model
-        self._entities_parquet = entities_parquet
         self._relationships_parquet = relationships_parquet
         self._local_reranker = local_reranker
 
@@ -143,25 +143,32 @@ class GraphRAGRetriever:
 
         try:
             import pandas as pd
+            import time as _time
             loop = asyncio.get_event_loop()
             df = await loop.run_in_executor(
                 None,
                 functools.partial(pd.read_parquet, str(path), columns=["source", "target", "description", "weight"]),
             )
 
-            # Build bidirectional lookup: entity_name → list of related entities + descriptions
-            for _, row in df.iterrows():
-                src = str(row.get("source", "")).strip()
-                tgt = str(row.get("target", "")).strip()
-                desc = str(row.get("description", "")).strip()
-                weight = float(row.get("weight", 1.0))
-                if src and tgt:
-                    rel = {"target": tgt, "description": desc, "weight": weight}
-                    self._rel_lookup.setdefault(src, []).append(rel)
-                    rel_rev = {"target": src, "description": desc, "weight": weight}
-                    self._rel_lookup.setdefault(tgt, []).append(rel_rev)
+            t0 = _time.monotonic()
+            # Fill NaN and cast types once — avoids per-row overhead
+            df["source"]      = df["source"].fillna("").astype(str).str.strip()
+            df["target"]      = df["target"].fillna("").astype(str).str.strip()
+            df["description"] = df["description"].fillna("").astype(str).str.strip()
+            df["weight"]      = df["weight"].fillna(1.0).astype(float)
 
-            log.info("✅ Loaded %d entity relationship mappings", len(self._rel_lookup))
+            # Keep only rows where both endpoints are non-empty
+            df = df[(df["source"] != "") & (df["target"] != "")]
+
+            # Build bidirectional lookup via records (much faster than iterrows)
+            for row in df.itertuples(index=False):
+                fwd = {"target": row.target, "description": row.description, "weight": row.weight}
+                rev = {"target": row.source, "description": row.description, "weight": row.weight}
+                self._rel_lookup.setdefault(row.source, []).append(fwd)
+                self._rel_lookup.setdefault(row.target, []).append(rev)
+
+            elapsed = _time.monotonic() - t0
+            log.info("✅ Loaded %d entity relationship mappings in %.1fs", len(self._rel_lookup), elapsed)
 
         except Exception as exc:
             log.error("[graph_retriever] Failed to load relationships: %s", exc)
@@ -195,7 +202,7 @@ class GraphRAGRetriever:
         if not self._initialized or not self._embedder:
             return []
 
-        # Encode query with BGE-M3 (reuse existing model)
+        # Encode query with SentenceTransformer (DEk21, reuse existing model)
         try:
             query_vec = await self._encode_query(query)
         except Exception as exc:
@@ -233,8 +240,10 @@ class GraphRAGRetriever:
                     query=query,
                     docs=results,
                     top_k=top_k * 2,
-                    threshold=_GRAPH_RERANK_THRESHOLD,
                 )
+                # Apply graph-specific threshold: drop clearly irrelevant results.
+                # LocalReranker ranks but does not filter; we gate here.
+                results = [d for d in results if d.get("score", 0) >= _GRAPH_RERANK_THRESHOLD]
             except Exception as exc:
                 log.error("[graph_retriever] Local rerank failed: %s", exc)
                 results.sort(key=lambda d: d.get("score", 0), reverse=True)
@@ -255,19 +264,24 @@ class GraphRAGRetriever:
     # ------------------------------------------------------------------ #
 
     async def _encode_query(self, query: str) -> list:
-        """Encode query string into a dense vector using BGE-M3."""
+        """Encode query string into a 768-dim dense vector using SentenceTransformer (DEk21)."""
+        try:
+            from pyvi import ViTokenizer
+            segmented_query = ViTokenizer.tokenize(query)
+        except ImportError:
+            log.warning("[graph_retriever] pyvi not installed, using unsegmented query (may degrade quality)")
+            segmented_query = query
+
         loop = asyncio.get_event_loop()
         encode_fn = functools.partial(
             self._embedder.encode,
-            [query],
+            [segmented_query],
             batch_size=1,
-            return_dense=True,
-            return_sparse=False,
-            return_colbert_vecs=False,
-            max_length=512,
+            show_progress_bar=False,
+            normalize_embeddings=True,
         )
         result = await loop.run_in_executor(None, encode_fn)
-        return result["dense_vecs"][0].tolist()
+        return result[0].tolist()
 
     async def _search_table(
         self,

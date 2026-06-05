@@ -67,6 +67,11 @@ class LocalReranker:
         self.tokenizer = None
 
     def initialize(self):
+        import os
+        num_threads = int(os.getenv("TORCH_NUM_THREADS", "2"))
+        torch.set_num_threads(num_threads)
+        log.info(f"Capping PyTorch CPU threads to {num_threads}")
+
         log.info(f"Loading local reranker model: {self.model_name} (FP32)")
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self.model = AutoModelForSequenceClassification.from_pretrained(
@@ -88,7 +93,11 @@ class LocalReranker:
         if not docs or not self.model or not self.tokenizer:
             return docs
 
-        texts = [d.get("text", "") for d in docs]
+        # Prefer child_text (focused 400-token child snippet) when available.
+        # Falls back to "text" for backward compatibility with the existing flat-chunk schema.
+        # Under the parent-child architecture: child_text = what the model scores,
+        # "text" = full parent context returned to the LLM after ranking.
+        texts = [d.get("child_text") or d.get("text", "") for d in docs]
         valid_indices = [i for i, t in enumerate(texts) if t.strip()]
         if not valid_indices:
             log.warning("[reranker] All %d docs have empty text — returning empty", len(docs))

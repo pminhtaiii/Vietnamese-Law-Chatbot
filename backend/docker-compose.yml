@@ -41,5 +41,6 @@ services:
         condition: service_healthy
     environment:
       - QDRANT_HOST=http://qdrant:6333
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - MIMO_API_KEY=${MIMO_API_KEY}
+      - MIMO_BASE_URL=${MIMO_BASE_URL:-https://api.xiaomimimo.com/v1}
       - COHERE_API_KEY=${COHERE_API_KEY}

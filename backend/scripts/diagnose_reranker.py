@@ -73,7 +73,7 @@ async def get_raw_candidates(query: str, embedder, qdrant, top_k: int = 10):
 
 def rerank_with_scores(query: str, docs: list, tokenizer, model, max_length: int = 512):
     """Score each doc and return raw logits + sigmoid scores."""
-    texts = [d["text"] for d in docs]
+    texts = [d.get("child_text") or d.get("text", "") for d in docs]
     pairs = [[query, t] for t in texts if t.strip()]
 
     if not pairs:

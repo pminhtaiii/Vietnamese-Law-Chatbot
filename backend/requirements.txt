@@ -3,15 +3,17 @@ uvicorn[standard]
 pydantic
 python-dotenv
 qdrant-client
-FlagEmbedding
 openai
-transformers==4.44.2
+transformers>=4.44.2
+sentence-transformers
 pydantic-settings
 tavily-python
 cohere
 cachetools
 lancedb
 pandas
-torch
+# CPU-only wheel keeps the backend image buildable without pulling CUDA packages.
+torch==2.5.1+cpu
 sentencepiece
 accelerate
+pyvi

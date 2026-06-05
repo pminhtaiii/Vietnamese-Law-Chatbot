@@ -10,17 +10,26 @@ class Settings(BaseSettings):
     QDRANT_HOST: str = os.getenv("QDRANT_HOST", "http://qdrant:6333")
     QDRANT_DB_PATH: str = str(BASE_DIR / "data" / "qdrant_db_m3")
     COLLECTION_NAME: str = "vietnamese_laws_m3"
+
+    # Parent Store — SQLite lookup for parent_text after Qdrant retrieval.
+    # Set to empty string to disable (retriever degrades gracefully).
+    PARENTS_SQLITE_PATH: str = os.getenv(
+        "PARENTS_SQLITE_PATH",
+        str(BASE_DIR / "data" / "parents.sqlite"),
+    )
     
     # AI models configuration
-    EMBEDDING_MODEL: str = "BAAI/bge-m3"
+    EMBEDDING_MODEL: str = "huyydangg/DEk21_hcmute_embedding"
     RERANKER_MODEL: str = "thanhtantran/Vietnamese_Reranker"
     RERANKER_MAX_LENGTH: int = 2304
     # Runtime max_length for tokenization during rerank requests.
     # Much shorter than model capability (2304) because legal chunks are
     # typically 300-800 chars.  Reduces tokenization RAM by ~4.5x.
     RERANKER_REQUEST_MAX_LENGTH: int = int(os.getenv("RERANKER_REQUEST_MAX_LENGTH", "512"))
-    LLM_MODEL: str = os.getenv("LLM_MODEL", "gemini-3.1-flash-lite-preview")
-    QUERY_REFLECT_MODEL: str = os.getenv("QUERY_REFLECT_MODEL", "gemini-3.1-flash-lite-preview")
+    USE_LOCAL_RERANKER: bool = os.getenv("USE_LOCAL_RERANKER", "true").lower() in ("true", "1", "yes")
+    TORCH_NUM_THREADS: int = int(os.getenv("TORCH_NUM_THREADS", "2"))
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "mimo-v2.5-pro")
+    QUERY_REFLECT_MODEL: str = os.getenv("QUERY_REFLECT_MODEL", "mimo-v2.5-pro")
     USE_FP16: bool = True
 
     # Query reflection + intent routing configuration
@@ -39,17 +48,14 @@ class Settings(BaseSettings):
         "GRAPHRAG_LANCEDB_PATH",
         str(BASE_DIR.parent / "data_pipelines" / "graph_rag" / "output" / "lancedb"),
     )
-    GRAPHRAG_ENTITIES_PARQUET: str = os.getenv(
-        "GRAPHRAG_ENTITIES_PARQUET",
-        str(BASE_DIR.parent / "data_pipelines" / "graph_rag" / "output" / "entities.parquet"),
-    )
     GRAPHRAG_RELATIONSHIPS_PARQUET: str = os.getenv(
         "GRAPHRAG_RELATIONSHIPS_PARQUET",
         str(BASE_DIR.parent / "data_pipelines" / "graph_rag" / "output" / "relationships.parquet"),
     )
 
     # API keys
-    GEMINI_API_KEY: str = os.getenv('GEMINI_API_KEY', "")
+    MIMO_API_KEY: str = os.getenv('MIMO_API_KEY', "")
+    MIMO_BASE_URL: str = os.getenv('MIMO_BASE_URL', "https://api.xiaomimimo.com/v1")
     COHERE_API_KEY: str = os.getenv('COHERE_API_KEY', "")
     TAVILY_API_KEY: str = os.getenv('TAVILY_API_KEY', "")
 

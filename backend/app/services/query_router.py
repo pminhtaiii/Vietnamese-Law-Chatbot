@@ -38,9 +38,9 @@ ROUTE_MAP: Dict[IntentType, str] = {
     IntentType.LEGAL_LOOKUP: "rag",
     IntentType.DEFINITION:   "rag",
     IntentType.PROCEDURE:    "rag",
-    IntentType.COMPARE:      "rag",   # Tạm thời tắt graphrag
-    IntentType.MULTI_HOP:    "rag",   # Tạm thời tắt graphrag
-    IntentType.SUMMARIZE:    "rag",   # Tạm thời tắt 'both'
+    IntentType.COMPARE:      "rag",   # TODO: enable "both" after entity grounding bridge is built
+    IntentType.MULTI_HOP:    "rag",   # TODO: enable "both" after entity grounding bridge is built
+    IntentType.SUMMARIZE:    "both",  # Community reports (GraphRAG) + text chunks (RAG) in parallel
     IntentType.CHITCHAT:     "none",
 }
 

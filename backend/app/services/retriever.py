@@ -1,45 +1,22 @@
 """
-retriever.py — Phase 3: Hybrid retrieval with intent-aware strategies.
+retriever.py — Phase 3: Dense retrieval with intent-aware strategies.
 
-v3.1 changes (from stubs → real implementation):
-  - _hybrid_search() now connects to Qdrant via AsyncQdrantClient.
-    Encodes queries with BGE-M3 (dense + sparse), uses Qdrant prefetch
-    for RRF (Reciprocal Rank Fusion) between dense and sparse results.
-  - _rerank() now prioritizes the local `thanhtantran/Vietnamese_Reranker`
-    and falls back to Cohere rerank-v3.5 via AsyncClientV2 if local reranking fails.
-    Both methods are fully async and non-blocking.
-  - BGE-M3 encode() runs in asyncio.run_in_executor() to avoid blocking
-    the FastAPI event loop (PyTorch inference is CPU-bound).
-  - _extract_law_name_filter() uses Qdrant models.Filter with MatchText
-    on the "text" payload field (the only text field in our collection).
+v3.2 changes (BGE-M3 → DEk21 migration):
+  - Switched from BGE-M3 (hybrid dense+sparse) to DEk21 SentenceTransformer
+    (dense-only, 768-dim).  This halves Qdrant memory and simplifies the
+    pipeline — no sparse vectors, no RRF fusion, no lexical_weights parsing.
+  - _encode_queries() now uses SentenceTransformer.encode() which returns
+    a numpy array of dense vectors directly.
+  - _hybrid_search() renamed conceptually to dense-only search.  Uses a
+    single Qdrant query_points() call with `using="dense"` — no prefetch arms.
+  - Retains all intent strategies (COMPARE, SUMMARIZE, PROCEDURE, etc.)
+    and the parent_text enrichment step.
 
-  search_laws() accepts `intent` and `sub_entities` parameters.
-  Each intent gets a tailored retrieval strategy:
-
-    LEGAL_LOOKUP  → current behaviour (no change)
-    COMPARE       → one search per sub_entity → merge + tag → rerank together
-    SUMMARIZE     → top_k × 3, Qdrant payload filter by law/decree name
-    PROCEDURE     → standard search + ordering-keyword boost
-    DEFINITION    → tight top_k (≤3), stricter rerank threshold
-    MULTI_HOP     → chained: search(sub_q[0]) → search(sub_q[1] + ctx) → merge
-    CHITCHAT      → never called (guarded in routes.py)
-
-Logical notes:
-  - COMPARE: sub_entity searches run in parallel (asyncio.gather) for speed.
-    Each result is tagged with `entity_label` so the generator can build a
-    comparison table with entity columns.
-  - MULTI_HOP: chained means the top-3 texts from sub_q[0] are appended to
-    sub_q[1] as context before the second search.  This is crucial: without
-    the chain the second hop knows nothing about the first legal conclusion.
-  - SUMMARIZE top_k multiplier is capped at 30 to avoid memory issues.
-  - DEFINITION rerank threshold is stricter to surface the single definitive
-    article rather than a bag of loosely related docs.
-
-Qdrant collection schema (from bge-m3.ipynb + migrate.py):
+Qdrant collection schema (DEk21 era):
     Point ID   : int (= cid)
-    Vectors    : {"dense": 1024-dim COSINE, "sparse": SparseVector}
-    Payload    : {"text": str, "cid": int}
-    (migrate.py maps original "content" → "text" for Docker Qdrant)
+    Vectors    : {"dense": 768-dim COSINE}
+    Payload    : {"text": str, "cid": int, "parent_id": int,
+                  "doc_id": int, "title": str, "legal_type": str, "url": str}
 """
 
 from __future__ import annotations
@@ -80,16 +57,17 @@ _RERANK_MODEL = "rerank-v3.5"
 
 class Retriever:
     """
-    Hybrid legal document retriever (BGE-M3 + Qdrant RRF + local/Cohere rerank).
+    Dense legal document retriever (DEk21 + Qdrant + local/Cohere rerank).
 
     Dependencies injected via __init__:
       - qdrant_client   : qdrant_client.AsyncQdrantClient instance
       - cohere_client   : cohere.AsyncClientV2 instance (fallback reranker)
       - local_reranker  : LocalReranker instance (primary reranker)
-      - embedding_model : FlagEmbedding.BGEM3FlagModel instance
+      - embedding_model : SentenceTransformer instance (DEk21, 768-dim dense-only)
+      - parent_store    : ParentStore instance (SQLite parent_text lookup)
 
-    The embedding model is used to encode query strings into dense (1024-dim)
-    and sparse (lexical_weights) vectors for Qdrant hybrid search.
+    The embedding model encodes query strings into 768-dim dense vectors
+    for Qdrant cosine similarity search. No sparse vectors needed.
     """
 
     def __init__(
@@ -98,6 +76,7 @@ class Retriever:
         cohere_client: Any,
         local_reranker: Any = None,
         embedding_model: Any = None,
+        parent_store: Any = None,
         collection_name: str = "legal_docs",
         default_top_k: int = 5,
     ):
@@ -105,6 +84,7 @@ class Retriever:
         self._cohere         = cohere_client
         self._local_reranker = local_reranker
         self._embedder       = embedding_model
+        self._parent_store   = parent_store
         self._collection     = collection_name
         self._default_k      = default_top_k
 
@@ -146,29 +126,34 @@ class Retriever:
         )
 
         if intent == "COMPARE":
-            return await self._strategy_compare(
+            results = await self._strategy_compare(
                 user_query, top_k, extra_queries, sub_entities
             )
-        if intent == "SUMMARIZE":
-            return await self._strategy_summarize(
+        elif intent == "SUMMARIZE":
+            results = await self._strategy_summarize(
                 user_query, top_k, extra_queries
             )
-        if intent == "PROCEDURE":
-            return await self._strategy_procedure(
+        elif intent == "PROCEDURE":
+            results = await self._strategy_procedure(
                 user_query, top_k, extra_queries
             )
-        if intent == "DEFINITION":
-            return await self._strategy_definition(
+        elif intent == "DEFINITION":
+            results = await self._strategy_definition(
                 user_query, top_k, extra_queries
             )
-        if intent == "MULTI_HOP":
-            return await self._strategy_multi_hop(
+        elif intent == "MULTI_HOP":
+            results = await self._strategy_multi_hop(
                 user_query, top_k, extra_queries, sub_entities
             )
-        # Default: LEGAL_LOOKUP (and any unknown intent falls here safely)
-        return await self._strategy_legal_lookup(
-            user_query, top_k, extra_queries
-        )
+        else:
+            # Default: LEGAL_LOOKUP (and any unknown intent falls here safely)
+            results = await self._strategy_legal_lookup(
+                user_query, top_k, extra_queries
+            )
+
+        # Enrich results with parent_text from parents.sqlite (if available)
+        results = self._enrich_with_parent_texts(results)
+        return results
 
     # ------------------------------------------------------------------ #
     # Intent strategies
@@ -372,26 +357,29 @@ class Retriever:
     # Core search & rerank — real implementations
     # ------------------------------------------------------------------ #
 
-    async def _encode_queries(self, queries: List[str]) -> dict:
+    async def _encode_queries(self, queries: List[str]) -> list:
         """
-        Encode query strings into dense + sparse vectors using BGE-M3.
+        Encode query strings into dense vectors using SentenceTransformer (DEk21).
 
         Runs in a thread executor to avoid blocking the async event loop
-        (BGEM3FlagModel.encode() is synchronous PyTorch inference).
+        (SentenceTransformer.encode() is synchronous PyTorch inference).
 
-        Returns the raw output dict from model.encode() with keys:
-          - dense_vecs: list of numpy arrays (1024-dim each)
-          - lexical_weights: list of dicts {token_id: weight}
+        Returns a numpy array of shape (len(queries), 768).
         """
+        try:
+            from pyvi import ViTokenizer
+            segmented_queries = [ViTokenizer.tokenize(q) for q in queries]
+        except ImportError:
+            log.warning("[retriever] pyvi not installed, using unsegmented queries (may degrade quality)")
+            segmented_queries = queries
+
         loop = asyncio.get_event_loop()
         encode_fn = functools.partial(
             self._embedder.encode,
-            queries,
+            segmented_queries,
             batch_size=len(queries),
-            return_dense=True,
-            return_sparse=True,
-            return_colbert_vecs=False,
-            max_length=512,     # queries are short; save compute
+            show_progress_bar=False,
+            normalize_embeddings=True,
         )
         return await loop.run_in_executor(None, encode_fn)
 
@@ -402,16 +390,14 @@ class Retriever:
         payload_filter: Optional[qmodels.Filter] = None,
     ) -> List[Dict]:
         """
-        Run BGE-M3 dense + sparse search with RRF fusion in Qdrant.
+        Run dense-only search in Qdrant using DEk21 embeddings (768-dim).
 
         For each query:
-          1. Encode with BGE-M3 → (dense_vec, sparse_vec)
-          2. Send to Qdrant using query_points() with two prefetch arms
-             (one dense, one sparse) and RRF fusion.
+          1. Encode with SentenceTransformer → dense vector (768-dim)
+          2. Send to Qdrant using query_points() with a single dense query.
           3. Extract payload and score from results.
 
         Multiple queries are merged via a simple dict-based dedup (best score wins).
-        This implements cross-query RRF at the application level.
 
         Parameters
         ----------
@@ -431,47 +417,26 @@ class Retriever:
         try:
             embeddings = await self._encode_queries(queries)
         except Exception as exc:
-            log.error("[retriever] BGE-M3 encode failed: %s", exc)
+            log.error("[retriever] DEk21 encode failed: %s", exc)
             return []
-
-        dense_vecs = embeddings["dense_vecs"]
-        sparse_vecs = embeddings["lexical_weights"]
 
         # Merge results across all queries, keeping best score per doc_id.
         merged: dict[str, dict] = {}
 
         for i, query_text in enumerate(queries):
             try:
-                dense_vec = dense_vecs[i].tolist() if hasattr(dense_vecs[i], "tolist") else dense_vecs[i]
-                sparse_dict = sparse_vecs[i]
-                sparse_indices = [int(k) for k in sparse_dict.keys()]
-                sparse_values = list(sparse_dict.values())
+                dense_vec = embeddings[i].tolist() if hasattr(embeddings[i], "tolist") else list(embeddings[i])
 
-                # Qdrant prefetch + RRF: two retrieval arms fused by reciprocal rank.
+                # Dense-only search — no prefetch, no RRF fusion.
+                # Pass raw vector as query; `using="dense"` selects the
+                # named vector in the collection.
                 # search_params enables rescoring with original float32 vectors
                 # when the collection uses Scalar Quantization (int8).
                 result = await self._qdrant.query_points(
                     collection_name=self._collection,
-                    prefetch=[
-                        qmodels.Prefetch(
-                            query=dense_vec,
-                            using="dense",
-                            limit=top_k * 2,
-                            filter=payload_filter,
-                        ),
-                        qmodels.Prefetch(
-                            query=qmodels.SparseVector(
-                                indices=sparse_indices,
-                                values=sparse_values,
-                            ),
-                            using="sparse",
-                            limit=top_k * 2,
-                            filter=payload_filter,
-                        ),
-                    ],
-                    query=qmodels.FusionQuery(
-                        fusion=qmodels.Fusion.RRF,
-                    ),
+                    query=dense_vec,
+                    using="dense",
+                    query_filter=payload_filter,
                     limit=top_k,
                     with_payload=True,
                     search_params=qmodels.SearchParams(
@@ -488,11 +453,18 @@ class Retriever:
                     score = point.score if point.score is not None else 0.0
 
                     doc = {
-                        "cid":      doc_id,
-                        "id":       doc_id,
-                        "text":     payload.get("text", ""),
-                        "score":    score,
-                        "metadata": {},
+                        "cid":       doc_id,
+                        "id":        doc_id,
+                        "text":      payload.get("text", ""),
+                        "parent_id": payload.get("parent_id"),
+                        "score":     score,
+                        # Populate metadata from payload so _format_sources can
+                        # surface title/url in source chips without a second lookup.
+                        "metadata":  {
+                            "title":      payload.get("title", ""),
+                            "source":     payload.get("url", ""),
+                            "legal_type": payload.get("legal_type", ""),
+                        },
                     }
 
                     existing = merged.get(doc_id)
@@ -550,7 +522,10 @@ class Retriever:
 
         # Cap the number of docs sent to reranker to avoid limits and cost/latency
         docs_to_rerank = docs[:_RERANK_BATCH_SIZE]
-        texts = [d.get("text", "") for d in docs_to_rerank]
+        # Prefer child_text (focused 400-token child snippet) when available.
+        # Falls back to "text" for backward compatibility with the existing flat-chunk schema.
+        # This mirrors local_reranker.py and ensures Cohere + local rerankers score the same field.
+        texts = [d.get("child_text") or d.get("text", "") for d in docs_to_rerank]
 
         # Filter out empty texts
         valid_indices = [i for i, t in enumerate(texts) if t.strip()]
@@ -610,6 +585,61 @@ class Retriever:
     # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
+
+    def _enrich_with_parent_texts(self, docs: List[Dict]) -> List[Dict]:
+        """
+        Batch-resolve parent_id → parent_text from the ParentStore.
+
+        After Qdrant returns lean child payloads (which no longer carry
+        parent_text), this method looks up the full parent text from
+        parents.sqlite and attaches it to each result dict.
+
+        The generator needs parent_text to provide full legal context to the LLM.
+        Without this step, the generator would only see the narrow child snippet.
+        """
+        if not self._parent_store or not docs:
+            return docs
+
+        # Collect unique parent_ids from results
+        parent_ids: set[int] = set()
+        for doc in docs:
+            pid = doc.get("parent_id")
+            if pid is not None:
+                try:
+                    parent_ids.add(int(pid))
+                except (ValueError, TypeError):
+                    pass
+
+        if not parent_ids:
+            log.debug("[retriever] _enrich: no parent_ids found in results")
+            return docs
+
+        try:
+            parent_texts = self._parent_store.get_parent_texts(parent_ids)
+        except Exception as exc:
+            log.error("[retriever] ParentStore lookup failed: %s", exc)
+            return docs
+
+        # Swap parent_text into doc["text"] so generator._build_context() feeds
+        # the LLM the full ~8000-char parent context, not the narrow child snippet.
+        # Preserve child text in doc["child_text"] for the reranker (already scored
+        # at this point — enrichment runs after reranking in search_laws).
+        enriched = 0
+        for doc in docs:
+            pid = doc.get("parent_id")
+            if pid is not None:
+                pid_int = int(pid)
+                if pid_int in parent_texts:
+                    doc["child_text"]  = doc.get("text", "")   # reranker already used this
+                    doc["text"]        = parent_texts[pid_int]  # LLM sees full parent
+                    doc["parent_text"] = parent_texts[pid_int]  # backward-compat alias
+                    enriched += 1
+
+        log.debug(
+            "[retriever] _enrich: %d parent_ids looked up, %d docs enriched",
+            len(parent_ids), enriched,
+        )
+        return docs
 
     def _boost_by_keywords(
         self,

@@ -47,7 +47,7 @@ DEFAULT_SQLITE_DIR    = str(SCRIPT_DIR / "sqlite_outputs")
 DEFAULT_QDRANT_URL    = "http://localhost:6333"
 DEFAULT_COLLECTION    = "vietnamese_laws_m3"
 DEFAULT_BATCH_SIZE    = 500
-DEFAULT_EMBEDDING_DIM = 1024
+DEFAULT_EMBEDDING_DIM = 768
 CHECKPOINT_FILENAME   = "push_checkpoint.json"
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
@@ -197,7 +197,7 @@ def ensure_collection(
         )
         return
 
-    log.info("Creating collection '%s' (dim=%d, COSINE + sparse, SQ int8)", collection_name, dim)
+    log.info("Creating collection '%s' (dim=%d, COSINE, SQ int8, dense-only)", collection_name, dim)
     client.create_collection(
         collection_name=collection_name,
         vectors_config={
@@ -213,14 +213,11 @@ def ensure_collection(
                 ),
             ),
         },
-        sparse_vectors_config={
-            "sparse": models.SparseVectorParams(),
-        },
         optimizers_config=models.OptimizersConfigDiff(
             indexing_threshold=20000,
         ),
     )
-    log.info("Collection '%s' created with Scalar Quantization ✓", collection_name)
+    log.info("Collection '%s' created with Scalar Quantization (dense-only) ✓", collection_name)
 
 
 # ─── MAIN PUSH LOGIC ─────────────────────────────────────────────────────────
@@ -250,7 +247,7 @@ def push_one_sqlite(
     cursor = conn.cursor()
 
     # Count total rows
-    cursor.execute("SELECT COUNT(*) FROM chunks")
+    cursor.execute("SELECT COUNT(*) FROM children")
     total_rows = cursor.fetchone()[0]
 
     if start_offset >= total_rows:
@@ -266,7 +263,7 @@ def push_one_sqlite(
 
     # Fetch rows with OFFSET for resume
     cursor.execute(
-        "SELECT * FROM chunks LIMIT -1 OFFSET ?",
+        "SELECT * FROM children LIMIT -1 OFFSET ?",
         (start_offset,),
     )
 
@@ -287,41 +284,20 @@ def push_one_sqlite(
                 continue
             dense_vec = unpack_dense_blob(dense_blob, dim)
 
-            # Parse sparse vector
-            sparse_vec = parse_sparse_vector(
-                row["sparse_indices"], row["sparse_values"]
-            )
-
-            # Build vector dict
+            # Build vector dict — dense only
             vectors = {"dense": dense_vec}
-            if sparse_vec:
-                vectors["sparse"] = sparse_vec
 
-            # Payload bao gồm cả những field gốc (nếu có) và field dịch (nếu có)
-            # Khớp với schema của retriever.py và bổ sung thêm metadata phong phú
+            # Lean payload — no parent_text (looked up from parents.sqlite at query time).
+            # parent_id is the FK used to fetch the full parent context from the API layer.
+            # title + legal_type + url are stored in child table for filtering and source display.
             payload = {
                 "cid": cid,
+                "parent_id": int(row["parent_id"]) if row["parent_id"] else None,
                 "text": text,
-                # Mapping các cột tiếng Anh đang có sẵn trong SQLite hiện tại
-                "title": str(row["title"] or "") if "title" in row.keys() else "",
-                "so_ky_hieu": str(row["document_number"] or "") if "document_number" in row.keys() else "",
-                "loai_van_ban": str(row["legal_type"] or "") if "legal_type" in row.keys() else "",
-                "linh_vuc": str(row["legal_sectors"] or "") if "legal_sectors" in row.keys() else "",
-                "co_quan_ban_hanh": str(row["issuing_authority"] or "") if "issuing_authority" in row.keys() else "",
-                "ngay_ban_hanh": str(row["issuance_date"] or "") if "issuance_date" in row.keys() else "",
-                "nguon_thu_thap": str(row["url"] or "") if "url" in row.keys() else "",
-                
-                # Mapping các cột tiếng Việt bổ sung (nếu bạn update Kaggle script để lưu thêm)
-                "doc_id": int(row["doc_id"]) if "doc_id" in row.keys() else None,
-                "ngay_co_hieu_luc": str(row["ngay_co_hieu_luc"] or "") if "ngay_co_hieu_luc" in row.keys() else "",
-                "ngay_het_hieu_luc": str(row["ngay_het_hieu_luc"] or "") if "ngay_het_hieu_luc" in row.keys() else "",
-                "ngay_dang_cong_bao": str(row["ngay_dang_cong_bao"] or "") if "ngay_dang_cong_bao" in row.keys() else "",
-                "nganh": str(row["nganh"] or "") if "nganh" in row.keys() else "",
-                "chuc_danh": str(row["chuc_danh"] or "") if "chuc_danh" in row.keys() else "",
-                "nguoi_ky": str(row["nguoi_ky"] or "") if "nguoi_ky" in row.keys() else "",
-                "pham_vi": str(row["pham_vi"] or "") if "pham_vi" in row.keys() else "",
-                "thong_tin_ap_dung": str(row["thong_tin_ap_dung"] or "") if "thong_tin_ap_dung" in row.keys() else "",
-                "tinh_trang_hieu_luc": str(row["tinh_trang_hieu_luc"] or "") if "tinh_trang_hieu_luc" in row.keys() else "",
+                "doc_id": int(row["doc_id"]) if row["doc_id"] else None,
+                "title": str(row["title"] or ""),
+                "legal_type": str(row["legal_type"] or ""),
+                "url": str(row["url"] or ""),
             }
 
             batch_points.append(
@@ -412,9 +388,9 @@ def main():
         sys.exit(1)
 
     # Find all sqlite files, sorted
-    sqlite_files = sorted(sqlite_dir.glob("chunks_*.sqlite"))
+    sqlite_files = sorted(sqlite_dir.glob("children_*.sqlite"))
     if not sqlite_files:
-        log.error("No chunks_*.sqlite files found in %s", sqlite_dir)
+        log.error("No children_*.sqlite files found in %s", sqlite_dir)
         sys.exit(1)
 
     log.info("Found %d SQLite file(s) in %s", len(sqlite_files), sqlite_dir)

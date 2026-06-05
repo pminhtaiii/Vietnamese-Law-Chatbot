@@ -130,7 +130,7 @@ class ConversationMemory:
         self,
         conversation_id: str,
         llm_client: Optional[Any] = None,
-        model: str = "gemini-2.0-flash",
+        model: str = "mimo-v2.5-pro",
         window_size: int = WINDOW_SIZE,
     ):
         self._cid    = conversation_id
@@ -272,7 +272,7 @@ _MEMORY_LOCK = asyncio.Lock()
 async def get_memory(
     conversation_id: str,
     llm_client: Optional[Any] = None,
-    model: str = "gemini-2.0-flash",
+    model: str = "mimo-v2.5-pro",
     window_size: int = WINDOW_SIZE,
 ) -> ConversationMemory:
     """

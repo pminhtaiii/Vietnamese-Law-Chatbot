@@ -20,6 +20,12 @@ logs/
 output/
 artifacts/
 
+# Local agent/tooling state
+.agents/
+.clinerules/
+.gemini/
+.codex/
+
 # Data Pipelines (GraphRAG outputs)
 data_pipelines/graph_rag/output/
 data_pipelines/graph_rag/logs/

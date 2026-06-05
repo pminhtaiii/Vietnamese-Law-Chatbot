@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies (identical env to backend — reuses hf_cache volume)
+COPY requirements_phase6.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir --default-timeout=180 --retries=10 \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        -r requirements_phase6.txt
+
+# Copy only the scripts we need
+COPY scripts/ scripts/
+
+# Default: resume (use --reset to start fresh)
+ENTRYPOINT ["python", "scripts/06_build_embeddings_lancedb.py"]
+CMD []

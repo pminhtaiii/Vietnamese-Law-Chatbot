@@ -47,7 +47,7 @@ from qdrant_client.http import models as qmodels
 # ─── DEFAULTS ─────────────────────────────────────────────────────────────────
 
 DEFAULT_QDRANT_URL = "http://localhost:6333"
-DEFAULT_COLLECTION = "legal_docs"
+DEFAULT_COLLECTION = "vietnamese_laws_m3"   # fixed: was 'legal_docs' which doesn't exist
 DEFAULT_TARGET = 100
 DEFAULT_MIN_TEXT_LEN = 100
 DEFAULT_SEED = 42
@@ -85,22 +85,49 @@ log = logging.getLogger("golden_builder")
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 def get_legal_types(client: QdrantClient, collection: str) -> List[str]:
-    """Get all distinct legal_type values from the collection."""
+    """Get all distinct legal_type values from the collection via full scroll.
+
+    FIXED: was limited to 10,000 points — insufficient for 5.75M point collections.
+    Now scrolls the entire collection in batches to find all distinct values.
+    Also includes empty-string values as a fallback stratum.
+    """
     types: set[str] = set()
+    offset = None
+    SCROLL_LIMIT = 2000
 
-    result, _ = client.scroll(
-        collection_name=collection,
-        limit=10000,
-        with_payload=[PAYLOAD_LEGAL_TYPE],
-        with_vectors=False,
-    )
-    for point in result:
-        lt = point.payload.get(PAYLOAD_LEGAL_TYPE, "")
-        if lt:
-            types.add(str(lt))
+    while True:
+        result, next_offset = client.scroll(
+            collection_name=collection,
+            limit=SCROLL_LIMIT,
+            with_payload=[PAYLOAD_LEGAL_TYPE],
+            with_vectors=False,
+            offset=offset,
+        )
+        for point in result:
+            lt = (point.payload or {}).get(PAYLOAD_LEGAL_TYPE, "")
+            if lt is not None:
+                types.add(str(lt).strip())
+            # Stop collecting once we've found enough distinct types to stratify
+            if len(types) >= 30:
+                break
+        if len(types) >= 30 or next_offset is None or not result:
+            break
+        offset = next_offset
 
-    if not types:
-        log.warning("No legal_type values found in collection '%s'", collection)
+    # Remove pure empty-string type; keep as fallback stratum if no others found
+    non_empty = {t for t in types if t}
+    if non_empty:
+        types = non_empty
+    else:
+        log.warning(
+            "All '%s' values are empty strings in collection '%s'. "
+            "Run enrich_qdrant_metadata.py --write to populate metadata fields. "
+            "Falling back to single-stratum (no stratification).",
+            PAYLOAD_LEGAL_TYPE, collection,
+        )
+        types = {""}
+
+    log.info("Found %d distinct legal_type values: %s", len(types), sorted(types)[:10])
     return sorted(types)
 
 
@@ -215,7 +242,8 @@ def sample_chunks(
             must_not=[
                 qmodels.FieldCondition(
                     key=PAYLOAD_DOC_ID,
-                    match=qmodels.AnyValue(value=list(seen_doc_ids)),
+                    # FIXED: AnyValue does not exist — correct class is MatchAny
+                    match=qmodels.MatchAny(any=list(seen_doc_ids)),
                 )
             ]
         )
@@ -337,6 +365,7 @@ async def _call_llm(
     prompt: str,
     semaphore: asyncio.Semaphore,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    system_prompt: str = QUESTION_GEN_SYSTEM_PROMPT,  # FIXED: was hardcoded, now injectable
 ) -> Optional[List[Dict[str, str]]]:
     """Call LLM with retry and return parsed question/answer pairs."""
     import openai as openai_lib
@@ -347,7 +376,7 @@ async def _call_llm(
                 response = await client.chat.completions.create(
                     model=model,
                     messages=[
-                        {"role": "system", "content": QUESTION_GEN_SYSTEM_PROMPT},
+                        {"role": "system", "content": system_prompt},  # FIXED: was hardcoded
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.3,
@@ -490,6 +519,7 @@ async def generate_negative_samples(
     model: str = DEFAULT_MODEL,
     neg_count: int = 10,
     concurrency: int = DEFAULT_CONCURRENCY,
+    seed: int = DEFAULT_SEED,  # FIXED: was using unseeded module-level random
 ) -> List[Dict[str, Any]]:
     """Generate intentionally unanswerable Q&A records from a random chunk subset."""
     from openai import AsyncOpenAI
@@ -498,7 +528,9 @@ async def generate_negative_samples(
     client = AsyncOpenAI(api_key=api_key, base_url=base_url)
     semaphore = asyncio.Semaphore(concurrency)
 
-    subset = random.sample(samples, min(neg_count, len(samples)))
+    # FIXED: use seeded RNG for reproducibility (was random.sample() with no seed)
+    rng = random.Random(seed)
+    subset = rng.sample(samples, min(neg_count, len(samples)))
 
     async def _gen_one(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         prompt = make_negative_prompt(chunk["text"], chunk["legal_type"])
@@ -828,6 +860,7 @@ def main() -> int:
             model=args.model,
             neg_count=neg_count,
             concurrency=args.concurrency,
+            seed=args.seed,  # FIXED: pass seed for reproducibility
         ))
         all_records.extend(neg_records)
         log.info("Total Q&A records before validation: %d", len(all_records))
